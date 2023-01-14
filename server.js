@@ -1,74 +1,264 @@
 import TelegramBot from 'node-telegram-bot-api';
 import io from 'socket.io-client';
+import { v4 as uuid } from 'uuid';
 
-const socket = io(process.env.API_URL, { reconnect: true });
-
-const invokeAi = {
-  currentModel: null,
-  modelsList: null,
+process.env.NTBA_FIX_350 = true;
+function jsonToText(json) {
+  let text = '';
+  function formatJson(json, indentation = '') {
+    for (let key in json) {
+      if (typeof json[key] === 'undefined') continue;
+      if (Array.isArray(json[key])) {
+        text += indentation + key + ': \n';
+        for (let i = 0; i < json[key].length; i++) {
+          formatJson(json[key][i], indentation + '  ');
+        }
+      } else if (typeof json[key] === 'object') {
+        text += indentation + key + ': \n';
+        formatJson(json[key], indentation + '  ');
+      } else {
+        text += indentation + key + ': ' + json[key] + '\n';
+      }
+    }
+  }
+  formatJson(json);
+  return text;
 }
-
+const state = {
+  systemConfig: null,
+  modelChanged: [],
+  generationResult: [],
+};
+const socket = io(process.env.API_URL, { reconnect: true });
 socket.on('systemConfig', data => {
-  const { model_weights, model_list } = data;
-  invokeAi.currentModel = model_weights;
-  invokeAi.modelsList = model_list;
-  console.log(new Date(), `InvokeAI config loaded: ${model_weights}`);
+  state.systemConfig = data;
+  console.log(new Date(), 'InvokeAI config loaded');
 });
 socket.emit('requestSystemConfig');
-
-socket.on('modelChanged', data => {
-  const { model_name, model_list } = data;
-  invokeAi.currentModel = model_name;
-  invokeAi.modelsList = model_list;
-  console.log(new Date(), `InvokeAI model changed: ${model_name}`);
-});
-
-let queue = [];
-socket.on('generationResult', async data => {
-  const prompt = queue.find(item => data.dreamPrompt.includes(item.match[1]));
-  queue = queue.filter(item => item != prompt);
-  console.log(new Date(), `InvokeAI got a result for '${prompt.match[1]}' at ${data.url}`);
-  await bot.sendPhoto(prompt.msg.chat.id, `${process.env.INVOKEAI_ROOT}${data.url}`, {
-    reply_to_message_id: prompt.msg.message_id,
-    caption: prompt.job.dreamPrompt,
+socket.on('modelChanged', async data => {
+  let activeModel;
+  Object.keys(data.model_list).forEach(model => {
+    if (data.model_list[model].status === 'active') {
+      activeModel = data.model_list[model];
+      activeModel.name = model;
+      return;
+    }
   });
-  clearInterval(prompt.typingInterval);
+  console.log(new Date(), `InvokeAI model changed: ${activeModel.name}`);
+  const request = state.modelChanged.find(
+    item => data.model_name === item.match[1]
+  );
+  if (!request) return;
+  state.modelChanged = state.modelChanged.filter(item => item != request);
+  console.log(
+    new Date(),
+    `InvokeAI got a request to change the model to '${activeModel.name}'`
+  );
+  await bot.sendMessage(
+    request.msg.chat.id,
+    `Model is set to: ${activeModel.name}\n${
+      activeModel.description
+    }\n\nAvailable models:\n${Object.keys(data.model_list).join('\n')}`,
+    {
+      reply_to_message_id: request.msg.message_id,
+    }
+  );
+  clearInterval(request.typingInterval);
 });
-
+socket.on('generationResult', async data => {
+  const id = data?.metadata?.image?.extra?.id;
+  if (!id) return;
+  const quiet = data?.metadata?.image?.extra?.quiet;
+  const request = state.generationResult.find(item => item.job.extra.id === id);
+  if (!request) return;
+  state.generationResult = state.generationResult.filter(
+    item => item != request
+  );
+  console.log(
+    new Date(),
+    `InvokeAI got a result for '${data.dreamPrompt}' at ${data.url}`
+  );
+  const caption = jsonToText({
+    model_weights: data.metadata.model_weights,
+    ...data.metadata.image,
+    ...(data.metadata.image.variations.length === 0 && {
+      variations: undefined,
+    }),
+    ...(!data.metadata.image.postprocessing && { postprocessing: undefined }),
+    extra: undefined,
+  });
+  await bot.sendPhoto(
+    request.msg.chat.id,
+    `${process.env.INVOKEAI_ROOT}${data.url}`,
+    {
+      reply_to_message_id: request.msg.message_id,
+      caption: quiet ? undefined : `<pre>${caption}</pre>`,
+      parse_mode: 'HTML',
+    }
+  );
+  clearInterval(request.typingInterval);
+});
 socket.on('error', data => {
   console.error('error', data);
 });
-
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-bot.onText(/\/invokeai (.+)/, async (msg, match) => {
-  const job = {
-    prompt: match[1],
-    iterations: 1,
-    steps: 50,
-    cfg_scale: 7.5,
-    threshold: 0,
-    perlin: 0,
-    height: 512,
-    width: 512,
-    sampler_name: 'k_lms',
-    seed: Math.floor(Math.random()*4294967295),
-    progress_images: false,
-    progress_latents: true,
-    save_intermediates: 5,
-    generation_mode: 'txt2img',
-    init_mask: '',
-    seamless: false,
-    hires_fix: false,
-    variation_amount: 0,
-  };
+bot.onText(/\/ia_usage/, async msg => {
+  await bot.sendMessage(
+    msg.chat.id,
+    '<pre>/ia Type prompt here.</pre>\n\nOr\n\n' +
+      '<pre>' +
+      '/ia Type prompt here. [negative tokens], (upweight)++, (downweight)-- ' +
+      '{-steps 50 -cfg_scale 7.5 -width 512 -height 512 -sampler_name ddim -seed 3950994677 -variation_amount 0.1 ' +
+      '-hires_fix false -seamless false -facefix codeformer|1|0.8|0.75 -quiet false}' +
+      '</pre>\n\n' +
+      'Other commands: /ia_model, /ia_samplers, /ia_queue, /ia_usage',
+    {
+      reply_to_message_id: msg.message_id,
+      parse_mode: 'HTML',
+    }
+  );
+});
+bot.onText(/\/ia_queue/, async msg => {
+  await bot.sendMessage(
+    msg.chat.id,
+    jsonToText(state.generationResult.map(item => item.job.extra.id)) ||
+      'Queue is empty',
+    {
+      reply_to_message_id: msg.message_id,
+    }
+  );
+});
+const samplers = [
+  'ddim',
+  'plms',
+  'k_lms',
+  'k_dpm_2',
+  'k_dpm_2_a',
+  'k_dpmpp_2',
+  'k_dpmpp_2_a',
+  'k_euler',
+  'k_euler_a',
+  'k_heun',
+];
+bot.onText(/\/ia_samplers/, async msg => {
+  await bot.sendMessage(msg.chat.id, samplers.join('\n'), {
+    reply_to_message_id: msg.message_id,
+  });
+});
+bot.onText(/\/ia_model(.*)/, async (msg, match) => {
   await bot.sendChatAction(msg.chat.id, 'typing');
-  const typingInterval = setInterval(async () => await bot.sendChatAction(msg.chat.id, 'typing'), 5000);
-  socket.emit('generateImage', job, false, false); // upscale, facefix
-  queue.push({
+  const typingInterval = setInterval(
+    async () => await bot.sendChatAction(msg.chat.id, 'typing'),
+    5000
+  );
+  state.modelChanged.push({
     msg,
     match,
+    typingInterval,
+  });
+  socket.emit('requestModelChange', match?.[1]?.trim());
+});
+bot.onText(/\/ia (.+)/, async (msg, match) => {
+  match[1] = match[1].replace(/\s+/g, ' ');
+  const params = match[1]
+    .match(/{(.*?)}/)?.[1]
+    ?.trim()
+    ?.split(' ');
+  const config = {};
+  if (params) {
+    for (let i = 0; i < params.length; i++) {
+      if (params[i].startsWith('-')) {
+        const key = params[i].substring(1);
+        const value = params[i + 1];
+        config[key] = value;
+        i++;
+      }
+    }
+  }
+  const quiet = config.quiet === 'true' ? true : false;
+  let steps = Number(config.steps) || 50;
+  steps < 1 && (steps = 1);
+  let cfg_scale =
+    config.cfg_scale === '0' ? 0 : Number(config.cfg_scale) || 7.5;
+  cfg_scale < 1.01 && (cfg_scale = 1.01);
+  let width = Number(config.width) || 512;
+  width < 64 && (width = 64);
+  width > 2048 && (width = 2048);
+  let height = Number(config.height) || 512;
+  height < 64 && (height = 64);
+  height > 2048 && (height = 2048);
+  let sampler_name =
+    config.sampler_name ||
+    samplers[Math.floor(Math.random() * samplers.length)];
+  !samplers.includes(sampler_name) && (sampler_name = samplers[0]);
+  let seed = Number(config.seed) || Math.floor(Math.random() * 4294967295);
+  seed < 0.1 && (seed = 0.1);
+  let variation_amount = Number(config.variation_amount) || 0;
+  variation_amount < 0 && (variation_amount = 0);
+  variation_amount > 1 && (variation_amount = 1);
+  const hires_fix = config.hires_fix === 'true' ? true : false;
+  const seamless = config.seamless === 'true' ? true : false;
+  let upscale;
+  if (config.upscale) {
+    let upscaleProps = config.upscale.split('|');
+    upscale = {
+      level: Number(upscaleProps[0]) || 2,
+      strength: Number(upscaleProps[1]) || 0.5,
+    };
+  } else {
+    upscale = false;
+  }
+  let facefix;
+  if (config.facefix) {
+    let facefixProps = config.facefix.split('|');
+    facefix = {
+      type: facefixProps[0] === 'codeformer' ? 'codeformer' : 'gfpgan',
+      strength: Number(facefixProps[1]) || 0.8,
+      ...(facefixProps[0] === 'codeformer' && {
+        codeformer_fidelity: Number(facefixProps[2]) || 0.75,
+      }),
+    };
+  } else {
+    facefix = false;
+  }
+  const prompt = match[1].replace(/{(.*?)}/g, '').trim();
+  const id = uuid();
+  const job = Object.assign(
+    {
+      prompt,
+      iterations: 1,
+      threshold: 0,
+      perlin: 0,
+      progress_images: false,
+      progress_latents: false,
+      save_intermediates: 0,
+      generation_mode: 'txt2img',
+      init_mask: '',
+      extra: { id, quiet },
+    },
+    {
+      steps,
+      cfg_scale,
+      width,
+      height,
+      sampler_name,
+      seed,
+      variation_amount,
+      hires_fix,
+      seamless,
+    }
+  );
+  await bot.sendChatAction(msg.chat.id, 'typing');
+  const typingInterval = setInterval(
+    async () => await bot.sendChatAction(msg.chat.id, 'typing'),
+    5000
+  );
+  socket.emit('generateImage', job, upscale, facefix);
+  state.generationResult.push({
+    msg,
+    prompt,
     job,
-    typingInterval
+    typingInterval,
   });
 });
 const { first_name: botName } = await bot.getMe();
