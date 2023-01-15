@@ -58,9 +58,9 @@ socket.on('modelChanged', async data => {
   const request = state.modelChanged.find(
     item => item.model === data.model_name
   );
-  request &&
-    (state.modelChanged = state.modelChanged.filter(item => item !== request));
   console.log(new Date(), `InvokeAI model set to ${activeModel.name}`);
+  if (!request) return;
+  state.modelChanged = state.modelChanged.filter(item => item !== request);
   await bot.sendMessage(
     request.msg.chat.id,
     `Model set to ${activeModel.name}\n${activeModel.description}`,
